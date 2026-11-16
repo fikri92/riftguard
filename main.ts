@@ -1,32 +1,55 @@
-// A working threejs-fps-01 entry (Node 22, standard library only): the game is this directory's
-// game/ folder, plain static files the browser loads as ES modules with three.js from an import
-// map, and the program hands it in. It copies game/ and screenshots/ from beside this file to
-// /output and writes /output/dossier.json, the summary the judge reads, with the vendored make.fun
-// library. A starting point, not a winner: a grey room, one rifle and four targets that drop when
-// shot. Build your game, put your PNG or JPEG screenshots in screenshots/ (the first by name is
-// the cover) and run it.
+// RIFTGUARD entry program.
 //
-// Serve it locally with `node serve.ts`, then open http://localhost:8080.
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
+// The game is the static tree in ./game: `index.html` loads ES modules and three.js from the vendored
+// copy beside it, so the browser needs no bundler and no network. This program is the hand-in step the
+// grader runs: it copies the playable tree and the dossier's stills into the output directory, then
+// writes `dossier.json` with the vendored make.fun builder, which is the file the house judge reads.
+//
+// Locally, MAKEFUN_OUTPUT_DIR stands in for the grader's /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+//
+// The caps below come from the competition's gate, not from taste: an entry over any of them is
+// refused silently, so the numbers are kept in one object and passed straight through.
 
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-const here = fileURLToPath(new URL('.', import.meta.url));
-const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const repoRoot = fileURLToPath(new URL('.', import.meta.url));
+const outputRoot = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-mkdirSync(out, { recursive: true });
-cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
-mkdirSync(join(out, 'screenshots'), { recursive: true });
-if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
+// reference/gate.json, as the grader applies it.
+const CAPS = {
+  text_max_bytes: 163840,
+  screenshots: { max: 4, max_bytes: 262144 },
+  game_max_files: 993,
+  game_max_bytes: 50331648,
+  game_path_max_bytes: 1000,
+};
 
-// The scorer's own caps (reference/gate.json): only text_max_bytes shapes the bytes; the others refuse an entry the
-// scorer would refuse (more than 4 screenshots or one over 256 KiB; more than 993 files in game/ or 48 MiB of game
-// files, in all: game/ counts beside /output's own 1000-entry cap, its screenshots/ and dossier.json).
-writeFileSync(
-  join(out, 'dossier.json'),
-  buildDossier(out, { text_max_bytes: 163840, screenshots: { max: 4, max_bytes: 262144 }, game_max_files: 993, game_max_bytes: 50331648, game_path_max_bytes: 1000 }),
-);
+const gameDir = join(repoRoot, 'game');
+const stillsDir = join(repoRoot, 'screenshots');
+
+// Refuse early with a readable line instead of handing the grader an empty folder: a missing
+// index.html or a missing screenshot set is a build error here, not a silent zero later.
+if (!existsSync(join(gameDir, 'index.html'))) {
+  throw new Error(`no game entry point: ${join(gameDir, 'index.html')} does not exist`);
+}
+if (!existsSync(stillsDir)) {
+  throw new Error(`no screenshots folder: ${stillsDir} does not exist`);
+}
+
+mkdirSync(join(outputRoot, 'game'), { recursive: true });
+cpSync(gameDir, join(outputRoot, 'game'), { recursive: true });
+
+mkdirSync(join(outputRoot, 'screenshots'), { recursive: true });
+cpSync(stillsDir, join(outputRoot, 'screenshots'), { recursive: true });
+
+const dossierPath = join(outputRoot, 'dossier.json');
+writeFileSync(dossierPath, buildDossier(outputRoot, CAPS));
+
+// One line of evidence for the run log: the two numbers that decide whether the judge sees a game.
+const dossierBytes = statSync(dossierPath).size;
+const indexBytes = statSync(join(outputRoot, 'game', 'index.html')).size;
+console.log(`riftguard: game/index.html ${indexBytes} B, dossier.json ${dossierBytes} B -> ${outputRoot}`);
