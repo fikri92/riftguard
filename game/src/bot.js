@@ -3,6 +3,7 @@
 // aim has settled. They hold angles, fall back to cover when hurt, and hear gunfire.
 import { NAV_HINTS, SITE } from './map.js';
 import { aimDirection } from './player.js';
+import { findPath, clearLine, isBlockedAt } from './nav.js';
 
 const VIEW_RANGE = 52;
 const FOV_COS = Math.cos(1.15); // about 66 degrees either side
@@ -55,6 +56,14 @@ export function createBot(team, index, rng) {
     burstLeft: 2,
     burstPauseUntil: 0,
     hasFrag: false,
+    // Navigation: a walked path to the current destination, the destination it was planned for, and the
+    // stuck check that forces a replan when the body has not moved despite pressing forward.
+    path: null,
+    pathTo: null,
+    pathAt: -1,
+    lastCheckPos: { x: 0, z: 0 },
+    lastCheckAt: 0,
+    stuckFor: 0,
     rng,
   };
 }
@@ -123,60 +132,115 @@ export function stepBot(bot, dt, ctx) {
   }
   if (target === null && bot.target !== null && !bot.target.body.alive) bot.target = null;
 
-  // ---- 2. Goal selection: engage what is visible, otherwise walk the route, otherwise hold.
+  // ---- 2. Objective: a planted bomb pulls every defender onto it, a live round sends every attacker
+  // to the site, and an attacker that arrives stands still so the plant hold actually finishes. Every
+  // walk to a destination goes through the nav grid, so a barrel between here and there is walked round
+  // instead of pressed into.
   const p = bot.body.position;
-  if (target !== null) {
-    if (bot.goal !== 'engage') { bot.goal = 'engage'; bot.strafeUntil = 0; }
-  } else if (bot.goal === 'engage') {
-    bot.goal = bot.route !== null && bot.routeStep < bot.route.length ? 'advance' : 'hold';
-    bot.target = null;
+  const bomb = ctx.bomb ?? null;
+  const planted = bomb !== null && bomb.planted === true;
+  const siteDist = Math.hypot(SITE.x - p.x, SITE.z - p.z);
+  let objectivePoint = null;
+  let objectiveKind = 'hold';
+  if (planted && bot.team === 'B') {
+    objectivePoint = { x: bomb.x, z: bomb.z };
+    objectiveKind = 'defuse';
+  } else if (bot.team === 'A' && !planted) {
+    if (siteDist <= SITE.r + 1.1) {
+      objectivePoint = { x: SITE.x, z: SITE.z };
+      objectiveKind = 'plant';
+    } else {
+      objectivePoint = currentWaypoint(bot) ?? { x: SITE.x, z: SITE.z };
+      objectiveKind = 'advance';
+    }
+  } else if (currentWaypoint(bot) !== null) {
+    objectivePoint = currentWaypoint(bot);
+    objectiveKind = 'advance';
   }
 
-  // ---- 3. Facing: turn toward the target, or toward the next waypoint, at a bounded rate.
-  const turnRate = 5.4 * dt;
-  const wantYaw = (() => {
-    if (bot.target !== null) {
-      const t = bot.target.body.position;
-      return Math.atan2(-(t.x - p.x), -(t.z - p.z));
+  // Arriving on a waypoint advances the route; the last waypoint leaves the bot on its objective.
+  if (objectiveKind === 'advance' && objectivePoint === currentWaypoint(bot) && objectivePoint !== null) {
+    if (Math.hypot(objectivePoint.x - p.x, objectivePoint.z - p.z) < 1.9) bot.routeStep += 1;
+  }
+
+  const moving = objectiveKind === 'advance' || objectiveKind === 'defuse';
+  if (moving && objectivePoint !== null) {
+    const stale = bot.path === null || bot.pathAt < time - 1.5 || bot.pathTo === null
+      || Math.hypot(bot.pathTo.x - objectivePoint.x, bot.pathTo.z - objectivePoint.z) > 2.2;
+    if (stale) {
+      bot.path = findPath({ x: p.x, z: p.z }, objectivePoint);
+      bot.pathTo = { x: objectivePoint.x, z: objectivePoint.z };
+      bot.pathAt = time;
+      bot.pathStep = 0;
     }
-    const wp = currentWaypoint(bot);
-    if (wp === null) return bot.body.yaw;
-    return Math.atan2(-(wp.x - p.x), -(wp.z - p.z));
-  })();
+    while (bot.path !== null && bot.pathStep < bot.path.length
+      && Math.hypot(bot.path[bot.pathStep].x - p.x, bot.path[bot.pathStep].z - p.z) < 0.7) bot.pathStep += 1;
+  } else {
+    bot.path = null;
+    bot.pathStep = 0;
+  }
+
+  // Stuck check: pressing forward without moving means geometry the path should have gone round, so
+  // replan immediately instead of grinding into it for the rest of the round.
+  if (time - bot.lastCheckAt > 0.6) {
+    const moved = Math.hypot(p.x - bot.lastCheckPos.x, p.z - bot.lastCheckPos.z);
+    bot.stuckFor = moved < 0.25 && moving ? bot.stuckFor + 1 : 0;
+    bot.lastCheckPos = { x: p.x, z: p.z };
+    bot.lastCheckAt = time;
+    if (bot.stuckFor >= 2) {
+      bot.path = null;
+      bot.pathAt = -99;
+      bot.stuckFor = 0;
+    }
+  }
+
+  const engaged = target !== null;
+  bot.goal = engaged ? 'engage' : objectiveKind;
+
+  // ---- 3. Facing: the target, else the next point on the walked path, else the objective.
+  const navPoint = bot.path !== null && bot.pathStep < bot.path.length ? bot.path[bot.pathStep] : objectivePoint;
+  const facePoint = engaged ? bot.target.body.position : navPoint;
+  const turnRate = 5.4 * dt;
+  const wantYaw = facePoint === null ? bot.body.yaw : Math.atan2(-(facePoint.x - p.x), -(facePoint.z - p.z));
   let dyaw = wantYaw - bot.body.yaw;
   while (dyaw > Math.PI) dyaw -= Math.PI * 2;
   while (dyaw < -Math.PI) dyaw += Math.PI * 2;
   bot.body.yaw += Math.max(-turnRate, Math.min(turnRate, dyaw));
 
-  // ---- 4. Movement: advance along the route, strafe while engaging, hold otherwise.
+  // ---- 4. Movement: stand on the plant, walk the path, strafe in a fight, hold otherwise.
   const keys = new Set();
-  if (bot.goal === 'engage') {
+  const objDist = objectivePoint === null ? Infinity : Math.hypot(objectivePoint.x - p.x, objectivePoint.z - p.z);
+  if (objectiveKind === 'plant' && !planted) {
+    // Standing still is the plant: any key would walk the body off the site.
+  } else if (objectiveKind === 'defuse' && objDist < 1.25) {
+    // On the charge: stop so the defuse hold is not cancelled by walking off it.
+  } else if (moving && navPoint !== null) {
+    pressToward(bot, navPoint, keys);
+    if (engaged && targetDist < 100) {
+      const d = Math.sqrt(targetDist);
+      if (d < 4) { keys.delete('KeyW'); keys.add('KeyS'); }
+    }
+  } else if (engaged) {
     if (bot.strafeUntil < time) {
       bot.strafeDir = bot.rng.next() < 0.5 ? -1 : 1;
       bot.strafeUntil = time + 0.5 + bot.rng.next() * 0.9;
     }
     keys.add(bot.strafeDir > 0 ? 'KeyD' : 'KeyA');
-    // Back off if the target is very close, close in if it is far.
     const d = Math.sqrt(targetDist);
-    if (d < 5) keys.add('KeyS');
-    else if (d > 22) keys.add('KeyW');
+    if (d > 20) keys.add('KeyW');
     if (bot.health < 45 && bot.rng.next() < dt * 3.2) keys.add('KeyS');
-  } else if (bot.goal === 'advance') {
-    const wp = currentWaypoint(bot);
-    if (wp === null) {
-      bot.goal = 'hold';
-      bot.holdUntil = time + 4 + bot.rng.next() * 5;
-    } else {
-      const d = Math.hypot(wp.x - p.x, wp.z - p.z);
-      if (d < 1.8) {
-        bot.routeStep += 1;
-      } else {
-        keys.add('KeyW');
-      }
-    }
-  } else if (bot.goal === 'hold' && bot.holdUntil < time) {
+  } else if (bot.holdUntil < time) {
     bot.holdUntil = time + 5 + bot.rng.next() * 6;
     bot.body.yaw += (bot.rng.next() - 0.5) * 1.6;
+  }
+
+  // A prop directly ahead of a forward press: sidestep rather than grind into it.
+  if (keys.has('KeyW')) {
+    const yaw = bot.body.yaw;
+    if (isBlockedAt(p.x - Math.sin(yaw) * 1.1, p.z - Math.cos(yaw) * 1.1)) {
+      keys.delete('KeyW');
+      keys.add(bot.strafeDir > 0 ? 'KeyD' : 'KeyA');
+    }
   }
 
   // A bot holds a stance: it crouches when it stops to shoot from a hold at range.
@@ -196,6 +260,22 @@ export function stepBot(bot, dt, ctx) {
   } else {
     bot.body.pitch *= 0.94;
   }
+}
+
+// Press the keys that walk the body toward a world point: forward/back for the facing component, strafe
+// for the lateral one. The body moves where its yaw points, so a point off to the side needs A or D.
+function pressToward(bot, point, keys) {
+  const p = bot.body.position;
+  const yaw = bot.body.yaw;
+  const dx = point.x - p.x;
+  const dz = point.z - p.z;
+  const fwd = dx * -Math.sin(yaw) + dz * -Math.cos(yaw);
+  const side = dx * Math.cos(yaw) + dz * -Math.sin(yaw);
+  if (fwd > 0.25) keys.add('KeyW');
+  else if (fwd < -0.25) keys.add('KeyS');
+  if (side > 0.55) keys.add('KeyD');
+  else if (side < -0.55) keys.add('KeyA');
+  if (keys.size === 0) keys.add('KeyW'); // facing is already aligned: keep walking
 }
 
 function currentWaypoint(bot) {

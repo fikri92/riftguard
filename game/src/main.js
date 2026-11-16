@@ -13,7 +13,7 @@ import { createHud } from './hud.js';
 import { BUY_MENU, WEAPONS } from './weapon.js';
 import { PALETTE } from './palette.js';
 import { SITE, MAP_HALF } from './map.js';
-import { PHASE } from './round.js';
+import { PHASE, RULES } from './round.js';
 
 const params = new URLSearchParams(location.search);
 const shotMode = params.get('shot');
@@ -319,6 +319,12 @@ function handleEvents(events) {
       case 'planted':
         hud.banner('CHARGE PLANTED', 'defenders must defuse', 2200);
         break;
+      case 'plantStart':
+        hud.banner('PLANTING', 'hold the site', 900);
+        break;
+      case 'plantCancel':
+        hud.banner('PLANT INTERRUPTED', 'back in the site, press E', 1200);
+        break;
       case 'defused':
         hud.banner('CHARGE DEFUSED', 'warden holds', 2000);
         break;
@@ -366,11 +372,19 @@ function updateHud(dt) {
   hud.setClock(sim.match.timer, sim.match.phase === PHASE.BUY ? 'BUY' : sim.match.phase === PHASE.LIVE ? 'LIVE' : 'OVER');
 
   const bomb = sim.match.bomb;
+  const planting = sim.plant;
   if (bomb !== null && bomb.planted) {
     hud.setObjective(`Charge ${Math.max(0, Math.ceil(bomb.timer))}s — defend`, true);
   } else if (p.team === 'A') {
     const d = Math.hypot(p.body.position.x - SITE.x, p.body.position.z - SITE.z);
-    hud.setObjective(d <= SITE.r ? 'In site — press E to plant' : `Site ${Math.round(d)}m`, false);
+    if (planting.actor === p && planting.progress > 0) {
+      const pct = Math.min(99, Math.round((planting.progress / RULES.plantSeconds) * 100));
+      hud.setObjective(`Planting ${pct}% — stay in the site`, true);
+    } else if (planting.actor !== null && planting.actor !== p) {
+      hud.setObjective(`${planting.actor.name} is planting`, true);
+    } else {
+      hud.setObjective(d <= SITE.r ? 'In site — press E to plant' : `Site ${Math.round(d)}m`, false);
+    }
   } else {
     hud.setObjective('Hold the site', false);
   }
@@ -453,15 +467,126 @@ function frameShot(mode) {
   muzzle.material.opacity = 0;
 }
 
+// ---- hero frame: a firefight still that is guaranteed to have bodies in it -------------------
+// The plain play still frames the player's own body from behind, which can stare at a wall. This steps
+// the match until two opposing bodies are in contact range, then searches a ring of camera placements
+// and keeps the closest one that is outside the geometry and has a clear line to both of them.
+
+function segmentBlocked(p, q, colliders) {
+  const dx = q.x - p.x; const dy = q.y - p.y; const dz = q.z - p.z;
+  for (const c of colliders) {
+    if (c.maxY < 1.0) continue;
+    let tmin = 0; let tmax = 1; let ok = true;
+    const axes = [[p.x, dx, c.minX, c.maxX], [p.y, dy, c.minY, c.maxY], [p.z, dz, c.minZ, c.maxZ]];
+    for (const [o, d, lo, hi] of axes) {
+      if (Math.abs(d) < 1e-9) {
+        if (o < lo || o > hi) { ok = false; break; }
+        continue;
+      }
+      let t1 = (lo - o) / d; let t2 = (hi - o) / d;
+      if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
+      if (t1 > tmin) tmin = t1;
+      if (t2 < tmax) tmax = t2;
+      if (tmin > tmax) { ok = false; break; }
+    }
+    if (ok && tmax > 0.02 && tmin < 0.98) return true;
+  }
+  return false;
+}
+
+function insideSolid(p, colliders) {
+  return colliders.some((c) => c.maxY > 1.0
+    && p.x > c.minX - 0.5 && p.x < c.maxX + 0.5
+    && p.z > c.minZ - 0.5 && p.z < c.maxZ + 0.5
+    && p.y > c.minY - 0.2 && p.y < c.maxY + 0.2);
+}
+
+// Step the match until two opposing bodies are close and shots are already flying.
+function stepToFirefight(input, budgetFrames) {
+  let steps = 0; let fired = 0; let pair = null; let pairDist = Infinity;
+  while (steps < budgetFrames) {
+    sim.step(FIXED_STEP, input);
+    for (const ev of sim.drainEvents()) if (ev.type === 'shot') fired += 1;
+    steps += 1;
+    if (sim.match.phase !== PHASE.LIVE) continue;
+    for (const a of sim.actors) {
+      // The player has no third-person mesh, so a pair that includes them photographs as an empty lane.
+      if (!a.alive || a.isPlayer) continue;
+      for (const b of sim.actors) {
+        if (!b.alive || b.isPlayer || b.team === a.team) continue;
+        const d = Math.hypot(a.body.position.x - b.body.position.x, a.body.position.z - b.body.position.z);
+        if (d < pairDist && d > 2 && d < 16) { pairDist = d; pair = [a, b]; }
+      }
+    }
+    // A good firefight still needs both teams still standing; once a wipe starts, the lane is empty.
+    const alive = sim.actors.filter((a) => a.alive).length;
+    if (pair !== null && pairDist < 11 && alive >= 6 && fired > 6) break;
+  }
+  return { pair, pairDist, fired, steps, alive: sim.actors.filter((a) => a.alive).length };
+}
+
+function frameFirefight(pair) {
+  const alive = sim.actors.filter((a) => a.alive);
+  const focus = pair
+    ? { x: (pair[0].body.position.x + pair[1].body.position.x) / 2, z: (pair[0].body.position.z + pair[1].body.position.z) / 2 }
+    : alive.reduce((m, a) => ({ x: m.x + a.body.position.x / (alive.length || 1), z: m.z + a.body.position.z / (alive.length || 1) }), { x: 0, z: 0 });
+  const targets = pair
+    ? [{ x: pair[0].body.position.x, y: pair[0].body.position.y + 1.3, z: pair[0].body.position.z },
+       { x: pair[1].body.position.x, y: pair[1].body.position.y + 1.3, z: pair[1].body.position.z }]
+    : [{ x: focus.x, y: 1.3, z: focus.z }];
+  const colliders = world.colliders;
+  let chosen = null;
+  for (const dist of [4.8, 6.2, 8, 10.5]) {
+    for (let k = 0; k < 16 && chosen === null; k += 1) {
+      const ang = (k / 16) * Math.PI * 2;
+      for (const height of [2.2, 3.0, 4.2]) {
+        const p = { x: focus.x + Math.cos(ang) * dist, y: height, z: focus.z + Math.sin(ang) * dist };
+        if (insideSolid(p, colliders)) continue;
+        if (targets.some((t) => segmentBlocked(p, t, colliders))) continue;
+        chosen = { p, dist, height };
+        break;
+      }
+    }
+    if (chosen) break;
+  }
+  if (chosen === null) chosen = { p: { x: focus.x + 7, y: 6.5, z: focus.z + 7 }, dist: 9.9, height: 6.5 };
+  camera.fov = 60;
+  camera.updateProjectionMatrix();
+  camera.position.set(chosen.p.x, chosen.p.y, chosen.p.z);
+  camera.rotation.set(0, 0, 0);
+  camera.lookAt(focus.x, 1.05, focus.z);
+  viewModel.visible = false;
+  muzzle.material.opacity = 0;
+  return { focus, chosen };
+}
+
 function runShot(mode) {
   const input = scriptedInput(0);
   // Enough simulation for bodies to leave spawn, meet and trade shots: 4 s of buy plus ~20 s of play.
-  const frames = mode === 'start' ? 0 : mode === 'end' ? 5400 : 1500;
+  const frames = mode === 'start' ? 0 : mode === 'end' ? 5400 : mode === 'hero' ? 0 : 1500;
   for (let i = 0; i < frames; i += 1) {
     if (sim.match.phase === PHASE.BUY && sim.match.timer > 0.1 && i < 8) sim.match.timer = 0.02;
-    const evs = sim.step(FIXED_STEP, input);
-    handleEvents(evs);
+    sim.step(FIXED_STEP, input);
+    // step() returns the simulation's live event list; draining it here is what stops the same events
+    // being re-handled on every later frame.
+    handleEvents(sim.drainEvents());
     if (mode === 'end' && sim.match.phase === PHASE.ENDED) break;
+  }
+  let heroInfo = null;
+  if (mode === 'hero') {
+    const fight = stepToFirefight(input, 60 * 40);
+    const framed = frameFirefight(fight.pair);
+    // Only primitives: the capture tool reads this back through CDP.
+    heroInfo = {
+      pair: fight.pair === null ? null : [fight.pair[0].name, fight.pair[1].name],
+      pairDist: fight.pairDist === Infinity ? null : +fight.pairDist.toFixed(1),
+      fired: fight.fired,
+      steps: fight.steps,
+      focus: { x: +framed.focus.x.toFixed(1), z: +framed.focus.z.toFixed(1) },
+      camera: { dist: framed.chosen.dist, height: framed.chosen.height },
+      alive: sim.actors.filter((a) => a.alive).length,
+      round: sim.match.round,
+    };
   }
   document.getElementById('overlay').hidden = true;
   document.getElementById('brief').hidden = true;
@@ -481,6 +606,8 @@ function runShot(mode) {
     viewModel.visible = false;
     document.getElementById('overlay').hidden = false;
     document.getElementById('brief').hidden = false;
+  } else if (mode === 'hero') {
+    // already framed by frameFirefight, after the extra stepping above
   } else {
     frameShot(mode);
   }
@@ -499,6 +626,16 @@ function runShot(mode) {
   }
 
   renderer.render(scene, camera);
+  if (heroInfo !== null) {
+    window.__HERO_INFO = heroInfo;
+    // Keep painting the composed frame: a headless tab hands back the last committed frame, so a single
+    // render during load is not what the screenshot tool sees unless the loop keeps presenting it.
+    const paint = () => {
+      renderer.render(scene, camera);
+      window.__HERO_RAF = requestAnimationFrame(paint);
+    };
+    window.__HERO_RAF = requestAnimationFrame(paint);
+  }
   document.documentElement.dataset.shotReady = mode;
 }
 
@@ -507,11 +644,15 @@ function runShot(mode) {
 function boot() {
   if (shotMode !== null) {
     // The capture harness may inspect and re-frame the scene it just drew.
-    window.__RIFTGUARD = { scene, camera, renderer, sim, THREE, hud };
+    window.__RIFTGUARD = { scene, camera, renderer, sim, THREE, hud, SITE, RULES, syncBodies, syncBomb, updateHud, viewModel, world, bodies };
     runShot(shotMode);
     window.__RIFTGUARD_READY__ = true;
     return;
   }
+
+  // The live loop keeps the same debug handle the capture harness uses, so a headless play-test can
+  // read the simulation it is driving with real input events.
+  window.__RIFTGUARD = { scene, camera, renderer, sim, THREE, hud, SITE, RULES };
 
   const input = createInput(renderer.domElement, (locked) => {
     if (!locked) buyOpen = false, hud.showBuy(false);
@@ -547,8 +688,9 @@ function boot() {
     // does not spiral.
     let steps = 0;
     while (acc >= FIXED_STEP && steps < 5) {
-      const evs = sim.step(FIXED_STEP, input);
-      handleEvents(evs);
+      sim.step(FIXED_STEP, input);
+      // Drain, never re-handle: the event list is the simulation's own buffer.
+      handleEvents(sim.drainEvents());
       acc -= FIXED_STEP;
       steps += 1;
     }

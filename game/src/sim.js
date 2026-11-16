@@ -52,7 +52,8 @@ export function createSimulation({ seed = 1, teamSize = RULES.teamSize } = {}) {
   });
 
   const bots = [];
-  for (let i = 0; i < teamSize; i += 1) {
+  // The player is one of the four attackers, so team A fields teamSize - 1 bots beside them.
+  for (let i = 0; i < teamSize - 1; i += 1) {
     const b = createBot('A', i, makeRng(seed * 31 + i + 1));
     const p = createPlayer(world.colliders);
     b.body = p.body;
@@ -85,6 +86,8 @@ export function createSimulation({ seed = 1, teamSize = RULES.teamSize } = {}) {
   const actors = [player, ...bots];
   const grenades = [];
   const damageQueue = [];
+  // Plant progress: which attacker is planting and how far along the hold is.
+  const plant = { actor: null, progress: 0 };
   const tmpDir = { x: 0, y: 0, z: 0 };
 
   let time = 0;
@@ -158,6 +161,8 @@ export function createSimulation({ seed = 1, teamSize = RULES.teamSize } = {}) {
       }
     }
     match.bomb = null;
+    plant.actor = null;
+    plant.progress = 0;
     grenades.length = 0;
 
     // Bots spend their money at the top of the round, the way a player does in the buy window: the
@@ -402,10 +407,12 @@ export function createSimulation({ seed = 1, teamSize = RULES.teamSize } = {}) {
       }
     }
 
-    // Bots: same body stepper, own decisions.
+    // Bots: same body stepper, own decisions. They stay frozen through the buy window, the way the
+    // player does, so a round never opens with a team already shot to pieces.
     for (const actor of bots) {
       const bot = actor.bot;
       if (!actor.alive) continue;
+      if (match.phase === PHASE.BUY) continue;
       bot.health = actor.health;
       const mates = actors.filter((a) => a.team === bot.team && a !== actor);
       const foes = actors.filter((a) => a.team !== bot.team);
@@ -415,11 +422,24 @@ export function createSimulation({ seed = 1, teamSize = RULES.teamSize } = {}) {
         enemies: foes,
         traceWorld: rayWorld,
         time,
+        bomb: match.bomb,
         move: (b, d, keys, aiming) => actor.player.step(d, keys, aiming),
         fire: () => fireShot(actor, 1),
       });
       actor.body.yaw = bot.body.yaw;
       actor.body.pitch = bot.body.pitch;
+
+      // An attacker that has walked into the site starts the plant; a defender standing on a planted
+      // charge holds the defuse. Both route through the same use action the player's E key uses.
+      if (match.phase === PHASE.LIVE) {
+        if (actor.team === 'A' && match.bomb === null && inSite(actor)) {
+          startPlant(actor);
+        } else if (actor.team === 'B' && match.bomb !== null && match.bomb.planted) {
+          const d = Math.hypot(actor.body.position.x - match.bomb.x, actor.body.position.z - match.bomb.z);
+          if (d <= 1.9) handleUse(actor);
+          else if (match.bomb.defusedBy === actor) handleUse(actor);
+        }
+      }
     }
 
     // Grenades, then the damage they deal.
@@ -437,7 +457,8 @@ export function createSimulation({ seed = 1, teamSize = RULES.teamSize } = {}) {
     // Damage is applied after every shot and burst this step, in the order it was queued.
     while (damageQueue.length > 0) applyDamage(damageQueue.shift());
 
-    // The bomb: its owner must be standing in the site for the plant to finish.
+    // The bomb: whoever is planting keeps the progress, and the defuse timer runs off the same tick.
+    tickPlant(dt);
     tickBomb(dt);
     checkRoundEnd();
 
@@ -458,6 +479,7 @@ export function createSimulation({ seed = 1, teamSize = RULES.teamSize } = {}) {
   function tickBomb(dt) {
     const bomb = match.bomb;
     if (bomb === null || !bomb.planted) return;
+    if (match.phase !== PHASE.LIVE) return; // a finished round owns no defuse progress
     if (bomb.defusing) {
       bomb.defuseProgress += dt;
       if (bomb.defuseProgress >= RULES.defuseSeconds) {
@@ -470,12 +492,41 @@ export function createSimulation({ seed = 1, teamSize = RULES.teamSize } = {}) {
     }
   }
 
-  // The use key: plant when an attacker stands in the site carrying the bomb, or defuse when a
-  // defender stands on a planted one.
-  function handleUse(actor) {
+  // The plant is a hold, not an instant: an attacker standing in the site starts it, progress grows
+  // while they stay alive and inside, and leaving (or dying) drops it back to zero.
+  function inSite(actor) {
     const p = actor.body.position;
-    const inSite = Math.hypot(p.x - SITE.x, p.z - SITE.z) <= SITE.r;
-    if (actor.team === 'A' && match.bomb === null && inSite && match.phase === PHASE.LIVE) {
+    return Math.hypot(p.x - SITE.x, p.z - SITE.z) <= SITE.r;
+  }
+
+  function startPlant(actor) {
+    if (match.phase !== PHASE.LIVE || match.bomb !== null || !actor.alive) return false;
+    if (actor.team !== 'A' || !inSite(actor)) return false;
+    if (plant.actor !== actor) {
+      plant.actor = actor;
+      plant.progress = 0;
+      events.push({ type: 'plantStart', actor });
+    }
+    return true;
+  }
+
+  function tickPlant(dt) {
+    if (match.phase !== PHASE.LIVE || match.bomb !== null) {
+      plant.actor = null;
+      plant.progress = 0;
+      return;
+    }
+    const actor = plant.actor;
+    if (actor === null) return;
+    if (!actor.alive || !inSite(actor)) {
+      plant.actor = null;
+      plant.progress = 0;
+      events.push({ type: 'plantCancel', actor });
+      return;
+    }
+    plant.progress += dt;
+    if (plant.progress >= RULES.plantSeconds) {
+      const p = actor.body.position;
       match.bomb = createBomb(actor);
       match.bomb.planted = true;
       match.bomb.x = p.x;
@@ -483,11 +534,26 @@ export function createSimulation({ seed = 1, teamSize = RULES.teamSize } = {}) {
       match.bomb.z = p.z;
       actor.money = Math.min(RULES.maxMoney, actor.money + RULES.plantReward);
       events.push({ type: 'planted', bomb: match.bomb });
-    } else if (actor.team === 'B' && match.bomb !== null && match.bomb.planted) {
+      plant.actor = null;
+      plant.progress = 0;
+    }
+  }
+
+  // The use key: start a plant when an attacker stands in the site, or hold a defuse when a defender
+  // stands on a planted charge.
+  function handleUse(actor) {
+    const p = actor.body.position;
+    if (actor.team === 'A' && match.phase === PHASE.LIVE && match.bomb === null) {
+      return startPlant(actor);
+    }
+    if (actor.team === 'B' && match.bomb !== null && match.bomb.planted) {
       const d = Math.hypot(p.x - match.bomb.x, p.z - match.bomb.z);
       match.bomb.defusing = d <= 1.9;
       if (match.bomb.defusing) match.bomb.defusedBy = actor;
+      else if (match.bomb.defusedBy === actor) match.bomb.defusedBy = null;
+      return match.bomb.defusing;
     }
+    return false;
   }
 
   function drainEvents() {
@@ -525,6 +591,7 @@ export function createSimulation({ seed = 1, teamSize = RULES.teamSize } = {}) {
     get bots() { return bots; },
     get time() { return time; },
     get grenades() { return grenades; },
+    get plant() { return plant; },
     get shotCount() { return shotCount; },
     step,
     setWorld,
