@@ -475,7 +475,7 @@ function frameShot(mode) {
 function segmentBlocked(p, q, colliders) {
   const dx = q.x - p.x; const dy = q.y - p.y; const dz = q.z - p.z;
   for (const c of colliders) {
-    if (c.maxY < 1.0) continue;
+    if (c.maxY < 1.5) continue;
     let tmin = 0; let tmax = 1; let ok = true;
     const axes = [[p.x, dx, c.minX, c.maxX], [p.y, dy, c.minY, c.maxY], [p.z, dz, c.minZ, c.maxZ]];
     for (const [o, d, lo, hi] of axes) {
@@ -495,9 +495,9 @@ function segmentBlocked(p, q, colliders) {
 }
 
 function insideSolid(p, colliders) {
-  return colliders.some((c) => c.maxY > 1.0
-    && p.x > c.minX - 0.5 && p.x < c.maxX + 0.5
-    && p.z > c.minZ - 0.5 && p.z < c.maxZ + 0.5
+  return colliders.some((c) => c.maxY > 1.2
+    && p.x > c.minX - 0.3 && p.x < c.maxX + 0.3
+    && p.z > c.minZ - 0.3 && p.z < c.maxZ + 0.3
     && p.y > c.minY - 0.2 && p.y < c.maxY + 0.2);
 }
 
@@ -518,9 +518,9 @@ function stepToFirefight(input, budgetFrames) {
         if (d < pairDist && d > 2 && d < 16) { pairDist = d; pair = [a, b]; }
       }
     }
-    // A good firefight still needs both teams still standing; once a wipe starts, the lane is empty.
+    // Stop while the round is still live: a wipe would leave the camera framing respawns.
     const alive = sim.actors.filter((a) => a.alive).length;
-    if (pair !== null && pairDist < 11 && alive >= 6 && fired > 6) break;
+    if (sim.match.phase === PHASE.LIVE && pair !== null && pairDist < 12 && alive >= 6 && fired > 3) break;
   }
   return { pair, pairDist, fired, steps, alive: sim.actors.filter((a) => a.alive).length };
 }
@@ -536,7 +536,33 @@ function frameFirefight(pair) {
     : [{ x: focus.x, y: 1.3, z: focus.z }];
   const colliders = world.colliders;
   let chosen = null;
-  for (const dist of [4.8, 6.2, 8, 10.5]) {
+
+  // First choice: over the shoulder of one of the pair. At three metres the bodies read at thumbnail
+  // size, the muzzle line is visible, and the shot still shows the lane they are fighting down.
+  if (pair !== null) {
+    const [a, b] = pair;
+    const dx = b.body.position.x - a.body.position.x;
+    const dz = b.body.position.z - a.body.position.z;
+    const len = Math.hypot(dx, dz) || 1;
+    for (const side of [0.9, -0.9, 1.5, -1.5, 2.2, -2.2]) {
+      for (const back of [2.4, 3.0, 3.8]) {
+        for (const height of [1.75, 2.1, 2.6]) {
+          const p = {
+            x: a.body.position.x - (dx / len) * back + (-dz / len) * side,
+            y: height,
+            z: a.body.position.z - (dz / len) * back + (dx / len) * side,
+          };
+          if (insideSolid(p, colliders)) continue;
+          chosen = { p, dist: back, height };
+          break;
+        }
+        if (chosen) break;
+      }
+      if (chosen) break;
+    }
+  }
+
+  for (const dist of chosen === null ? [4.8, 6.2, 8, 10.5] : []) {
     for (let k = 0; k < 16 && chosen === null; k += 1) {
       const ang = (k / 16) * Math.PI * 2;
       for (const height of [2.2, 3.0, 4.2]) {
