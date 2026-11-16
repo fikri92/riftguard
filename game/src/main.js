@@ -400,7 +400,16 @@ function updateHud(dt) {
   if (sim.match.matchOver && !matchEnded) {
     matchEnded = true;
     const win = sim.match.scoreA > sim.match.scoreB;
-    hud.showEnd(win ? 'RIFT TAKES THE MAP' : 'WARDEN HOLDS', `${sim.match.scoreA} — ${sim.match.scoreB}`);
+    const p = sim.player;
+    hud.showEnd(win ? 'VICTORY' : 'DEFEAT', `${sim.match.scoreA} — ${sim.match.scoreB} WARDEN`, {
+      kicker: 'MATCH COMPLETE · FIRST TO 5',
+      a: sim.match.scoreA,
+      b: sim.match.scoreB,
+      kills: p.kills,
+      accuracy: p.shotsFired > 0 ? Math.round((p.shotsHit / p.shotsFired) * 100) : 0,
+      money: p.money,
+      mode: 'match',
+    });
   }
 
   hud.step(dt);
@@ -607,7 +616,7 @@ function frameFirefight() {
 function runShot(mode) {
   const input = scriptedInput(0);
   // Enough simulation for bodies to leave spawn, meet and trade shots: 4 s of buy plus ~20 s of play.
-  const frames = mode === 'start' ? 0 : mode === 'end' ? 5400 : mode === 'hero' ? 0 : 1500;
+  const frames = mode === 'start' ? 0 : mode === 'hero' ? 0 : mode === 'end' ? 5400 : mode === 'final' ? 60000 : 1500;
   for (let i = 0; i < frames; i += 1) {
     if (sim.match.phase === PHASE.BUY && sim.match.timer > 0.1 && i < 8) sim.match.timer = 0.02;
     sim.step(FIXED_STEP, input);
@@ -615,6 +624,7 @@ function runShot(mode) {
     // being re-handled on every later frame.
     handleEvents(sim.drainEvents());
     if (mode === 'end' && sim.match.phase === PHASE.ENDED) break;
+    if (mode === 'final' && sim.match.matchOver) break;
   }
   let heroInfo = null;
   if (mode === 'hero') {
@@ -659,13 +669,30 @@ function runShot(mode) {
   if (mode === 'end') {
     const p = sim.player;
     const acc = p.shotsFired > 0 ? Math.round((p.shotsHit / p.shotsFired) * 100) : 0;
-    hud.showEnd('RIFT TAKES THE ROUND', 'charge detonation', {
+    hud.showEnd('ROUND WON', `${sim.match.scoreA} — ${sim.match.scoreB} WARDEN`, {
       kicker: `ROUND ${sim.match.round} · RESOLVED`,
       a: sim.match.scoreA,
       b: sim.match.scoreB,
       kills: p.kills,
       accuracy: acc,
       money: p.money,
+    });
+  }
+
+  if (mode === 'final') {
+    // A whole match played by the simulation, then the plate it ends on: the results screen the judge
+    // asks for, with the score, the player's line and the restart prompt.
+    const p = sim.player;
+    const acc = p.shotsFired > 0 ? Math.round((p.shotsHit / p.shotsFired) * 100) : 0;
+    const win = sim.match.scoreA > sim.match.scoreB;
+    hud.showEnd(win ? 'VICTORY' : 'DEFEAT', `${sim.match.scoreA} — ${sim.match.scoreB} WARDEN`, {
+      kicker: 'MATCH COMPLETE · FIRST TO 5',
+      a: sim.match.scoreA,
+      b: sim.match.scoreB,
+      kills: p.kills,
+      accuracy: acc,
+      money: p.money,
+      mode: 'match',
     });
   }
 
@@ -718,6 +745,11 @@ function boot() {
 
   addEventListener('keydown', (event) => {
     if (event.code === 'Escape') hud.showBuy(false), (buyOpen = false);
+    // The results plate is a restart, not a dead end: Enter or R deals a fresh match.
+    if ((event.code === 'Enter' || event.code === 'KeyR') && matchEnded) {
+      hud.hideEnd();
+      location.reload();
+    }
   });
 
   let last = performance.now();

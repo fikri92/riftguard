@@ -121,8 +121,8 @@ const okPlay = await loadAndWait(`${base}?shot=play&seed=${seed}`, 'play');
 await sleep(500);
 await capture('2-firefight.jpg');
 
-// 3. End card: the round result plate with the score.
-const okEnd = await loadAndWait(`${base}?shot=end&seed=${seed}`, 'end');
+// 3. End card: a whole match played by the simulation, ending on the results plate with the restart.
+const okEnd = await loadAndWait(`${base}?shot=final&seed=${seed}`, 'final');
 await sleep(500);
 await capture('3-round-end.jpg');
 

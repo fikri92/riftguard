@@ -29,6 +29,7 @@ const HUD_HTML = `
   <p id="end-kicker">ROUND OVER</p>
   <h1 id="end-title">ROUND</h1>
   <div id="end-score"><b class="a" id="end-a">0</b><span class="dash">—</span><b class="b" id="end-b">0</b></div>
+  <div id="end-again">Press Enter to play again</div>
   <p id="end-sub"></p>
   <div id="end-stats">
     <div><b id="end-kills">0</b><span>Your kills</span></div>
@@ -50,7 +51,7 @@ export function createHud(root, buyItems) {
     hitmarker: $('hitmarker'), hurt: $('hurt'),
     banner: $('roundbanner'), bannerTitle: $('banner-title'), bannerSub: $('banner-sub'),
     buyMenu: $('buymenu'), buyList: $('buy-list'), buyTimer: $('buy-timer'),
-    end: $('endscreen'), endTitle: $('end-title'), endSub: $('end-sub'),
+    end: $('endscreen'), endTitle: $('end-title'), endSub: $('end-sub'), endAgain: $('end-again'),
     endKicker: $('end-kicker'), endA: $('end-a'), endB: $('end-b'),
     endKills: $('end-kills'), endAcc: $('end-acc'), endMoney: $('end-money'),
     killfeed: $('killfeed'),
@@ -141,6 +142,9 @@ export function createHud(root, buyItems) {
         els.endMoney.textContent = String(stats.money);
         els.endKicker.textContent = stats.kicker ?? 'ROUND OVER';
       }
+      els.endAgain.textContent = stats !== undefined && stats.mode === 'match'
+        ? 'Press Enter to play again'
+        : 'Press Enter for the next round';
       els.end.hidden = false;
     },
     hideEnd() {
