@@ -502,88 +502,106 @@ function insideSolid(p, colliders) {
 }
 
 // Step the match until two opposing bodies are close and shots are already flying.
+function livePairs() {
+  const out = [];
+  for (const a of sim.actors) {
+    if (!a.alive || a.isPlayer) continue;
+    for (const b of sim.actors) {
+      if (!b.alive || b.isPlayer || b.team === a.team) continue;
+      const d = Math.hypot(a.body.position.x - b.body.position.x, a.body.position.z - b.body.position.z);
+      if (d > 4 && d < 34) out.push({ a, b, d });
+    }
+  }
+  out.sort((p, q) => p.d - q.d);
+  return out;
+}
+
+// Step the match until the round is live with a duel in progress and the teams still standing.
 function stepToFirefight(input, budgetFrames) {
-  let steps = 0; let fired = 0; let pair = null; let pairDist = Infinity;
+  let steps = 0; let fired = 0;
   while (steps < budgetFrames) {
     sim.step(FIXED_STEP, input);
     for (const ev of sim.drainEvents()) if (ev.type === 'shot') fired += 1;
     steps += 1;
     if (sim.match.phase !== PHASE.LIVE) continue;
-    for (const a of sim.actors) {
-      // The player has no third-person mesh, so a pair that includes them photographs as an empty lane.
-      if (!a.alive || a.isPlayer) continue;
-      for (const b of sim.actors) {
-        if (!b.alive || b.isPlayer || b.team === a.team) continue;
-        const d = Math.hypot(a.body.position.x - b.body.position.x, a.body.position.z - b.body.position.z);
-        if (d < pairDist && d > 2 && d < 16) { pairDist = d; pair = [a, b]; }
-      }
-    }
-    // Stop while the round is still live: a wipe would leave the camera framing respawns.
     const alive = sim.actors.filter((a) => a.alive).length;
-    if (sim.match.phase === PHASE.LIVE && pair !== null && pairDist < 12 && alive >= 6 && fired > 3) break;
+    const pairs = livePairs();
+    if (alive >= 6 && fired > 3 && pairs.length > 0 && pairs[0].d < 26) break;
   }
-  return { pair, pairDist, fired, steps, alive: sim.actors.filter((a) => a.alive).length };
+  // If the budget ran out between fights, step on until a duel exists so the frame has bodies in it.
+  let extra = 0;
+  while (extra < 900 && livePairs().length === 0) {
+    sim.step(FIXED_STEP, input);
+    sim.drainEvents();
+    extra += 1;
+  }
+  return { steps: steps + extra, fired, alive: sim.actors.filter((a) => a.alive).length };
 }
 
-function frameFirefight(pair) {
-  const alive = sim.actors.filter((a) => a.alive);
-  const focus = pair
-    ? { x: (pair[0].body.position.x + pair[1].body.position.x) / 2, z: (pair[0].body.position.z + pair[1].body.position.z) / 2 }
-    : alive.reduce((m, a) => ({ x: m.x + a.body.position.x / (alive.length || 1), z: m.z + a.body.position.z / (alive.length || 1) }), { x: 0, z: 0 });
-  const targets = pair
-    ? [{ x: pair[0].body.position.x, y: pair[0].body.position.y + 1.3, z: pair[0].body.position.z },
-       { x: pair[1].body.position.x, y: pair[1].body.position.y + 1.3, z: pair[1].body.position.z }]
-    : [{ x: focus.x, y: 1.3, z: focus.z }];
+// A camera that frames one duel: perpendicular to the line between the two bodies, far enough back that
+// both sit inside a 60-degree frame, or over the shoulder of the first when the map leaves no room.
+function cameraForPair(pair, colliders) {
+  const { a, b, d } = pair;
+  const ax = a.body.position.x; const az = a.body.position.z;
+  const bx = b.body.position.x; const bz = b.body.position.z;
+  const dx = bx - ax; const dz = bz - az;
+  const len = Math.hypot(dx, dz) || 1;
+  const perpX = -dz / len; const perpZ = dx / len;
+  const focus = { x: (ax + bx) / 2, z: (az + bz) / 2 };
+  const off = Math.max(3.4, d * 1.05);
+  const candidates = [];
+  // First: the attacker's own eyes. Two bodies trading shots can see each other by definition, so this
+  // frames the enemy at fighting range with the HUD the player actually plays with.
+  const eyeY = Number.isFinite(a.body.eye) ? a.body.eye : 1.55;
+  candidates.push({ x: ax, y: a.body.position.y + eyeY, z: az, lookAt: { x: bx, y: b.body.position.y + 1.15, z: bz }, fov: 34 });
+  for (const side of [1, -1]) {
+    candidates.push({ x: focus.x + perpX * off * side, y: 1.95, z: focus.z + perpZ * off * side });
+    candidates.push({ x: focus.x + perpX * off * 1.4 * side, y: 2.7, z: focus.z + perpZ * off * 1.4 * side });
+  }
+  for (const side of [0.9, -0.9]) {
+    candidates.push({ x: ax - (dx / len) * 2.6 + perpX * side, y: 2.0, z: az - (dz / len) * 2.6 + perpZ * side });
+  }
+  const t1 = { x: ax, y: a.body.position.y + 1.2, z: az };
+  const t2 = { x: bx, y: b.body.position.y + 1.2, z: bz };
+  for (const p of candidates) {
+    if (insideSolid(p, colliders)) continue;
+    const look = p.lookAt ?? { x: focus.x, y: 1.1, z: focus.z };
+    if (p.lookAt === undefined) {
+      if (segmentBlocked(p, t1, colliders) || segmentBlocked(p, t2, colliders)) continue;
+      return { p, focus, dist: +Math.hypot(p.x - focus.x, p.z - focus.z).toFixed(1), height: p.y };
+    }
+    if (segmentBlocked(p, p.lookAt, colliders)) continue;
+    return { p, focus: { x: p.lookAt.x, z: p.lookAt.z }, lookAt: p.lookAt, fov: p.fov ?? 60, dist: +Math.hypot(p.x - p.lookAt.x, p.z - p.lookAt.z).toFixed(1), height: p.y };
+  }
+  return null;
+}
+
+function frameFirefight() {
   const colliders = world.colliders;
-  let chosen = null;
-
-  // First choice: over the shoulder of one of the pair. At three metres the bodies read at thumbnail
-  // size, the muzzle line is visible, and the shot still shows the lane they are fighting down.
-  if (pair !== null) {
-    const [a, b] = pair;
-    const dx = b.body.position.x - a.body.position.x;
-    const dz = b.body.position.z - a.body.position.z;
-    const len = Math.hypot(dx, dz) || 1;
-    for (const side of [0.9, -0.9, 1.5, -1.5, 2.2, -2.2]) {
-      for (const back of [2.4, 3.0, 3.8]) {
-        for (const height of [1.75, 2.1, 2.6]) {
-          const p = {
-            x: a.body.position.x - (dx / len) * back + (-dz / len) * side,
-            y: height,
-            z: a.body.position.z - (dz / len) * back + (dx / len) * side,
-          };
-          if (insideSolid(p, colliders)) continue;
-          chosen = { p, dist: back, height };
-          break;
-        }
-        if (chosen) break;
-      }
-      if (chosen) break;
-    }
+  const pairs = livePairs();
+  let framed = null;
+  for (const pair of pairs) {
+    const cam = cameraForPair(pair, colliders);
+    if (cam !== null) { framed = { pair, cam }; break; }
   }
-
-  for (const dist of chosen === null ? [4.8, 6.2, 8, 10.5] : []) {
-    for (let k = 0; k < 16 && chosen === null; k += 1) {
-      const ang = (k / 16) * Math.PI * 2;
-      for (const height of [2.2, 3.0, 4.2]) {
-        const p = { x: focus.x + Math.cos(ang) * dist, y: height, z: focus.z + Math.sin(ang) * dist };
-        if (insideSolid(p, colliders)) continue;
-        if (targets.some((t) => segmentBlocked(p, t, colliders))) continue;
-        chosen = { p, dist, height };
-        break;
-      }
-    }
-    if (chosen) break;
+  if (framed === null) {
+    const alive = sim.actors.filter((a) => a.alive && !a.isPlayer);
+    const c = alive.reduce((m, a) => ({ x: m.x + a.body.position.x / (alive.length || 1), z: m.z + a.body.position.z / (alive.length || 1) }), { x: 0, z: 0 });
+    framed = {
+      pair: null,
+      cam: { p: { x: c.x + 7, y: 6, z: c.z + 7 }, focus: c, dist: 9.9, height: 6 },
+    };
   }
-  if (chosen === null) chosen = { p: { x: focus.x + 7, y: 6.5, z: focus.z + 7 }, dist: 9.9, height: 6.5 };
-  camera.fov = 60;
+  const { pair, cam } = framed;
+  camera.fov = cam.fov ?? 60;
   camera.updateProjectionMatrix();
-  camera.position.set(chosen.p.x, chosen.p.y, chosen.p.z);
+  camera.position.set(cam.p.x, cam.p.y, cam.p.z);
   camera.rotation.set(0, 0, 0);
-  camera.lookAt(focus.x, 1.05, focus.z);
+  const look = cam.lookAt ?? { x: cam.focus.x, y: 1.1, z: cam.focus.z };
+  camera.lookAt(look.x, look.y, look.z);
   viewModel.visible = false;
   muzzle.material.opacity = 0;
-  return { focus, chosen };
+  return { pair, cam };
 }
 
 function runShot(mode) {
@@ -601,15 +619,15 @@ function runShot(mode) {
   let heroInfo = null;
   if (mode === 'hero') {
     const fight = stepToFirefight(input, 60 * 40);
-    const framed = frameFirefight(fight.pair);
+    const framed = frameFirefight();
     // Only primitives: the capture tool reads this back through CDP.
     heroInfo = {
-      pair: fight.pair === null ? null : [fight.pair[0].name, fight.pair[1].name],
-      pairDist: fight.pairDist === Infinity ? null : +fight.pairDist.toFixed(1),
+      pair: framed.pair === null ? null : [framed.pair.a.name, framed.pair.b.name],
+      pairDist: framed.pair === null ? null : +framed.pair.d.toFixed(1),
       fired: fight.fired,
       steps: fight.steps,
-      focus: { x: +framed.focus.x.toFixed(1), z: +framed.focus.z.toFixed(1) },
-      camera: { dist: framed.chosen.dist, height: framed.chosen.height },
+      focus: { x: +framed.cam.focus.x.toFixed(1), z: +framed.cam.focus.z.toFixed(1) },
+      camera: { dist: framed.cam.dist, height: framed.cam.height },
       alive: sim.actors.filter((a) => a.alive).length,
       round: sim.match.round,
     };
